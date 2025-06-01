@@ -72,36 +72,38 @@ class FusionNet(nn.Module):
             ).to(device=device, dtype=dtype)
 
     # ──────────────────────────────────────────────────────────
+      # ------------------------------------------------------------------
     def forward(
         self,
-        seq_tensor: torch.Tensor,            # (B,T,F)
+        seq_tensor: torch.Tensor,
         sym_tensor: Optional[torch.Tensor] = None,
         return_latent: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
 
         latent = self.encoder(seq_tensor, return_logits=False)   # (B, seq_dim)
 
-        # -------- symbolic handling ----------------------------------
+        # ---------- symbolic handling ---------------------------
         if sym_tensor is None:
             sym_tensor = torch.zeros(latent.size(0), 0,
                                      device=latent.device, dtype=latent.dtype)
-
-        if sym_tensor.ndim == 1:        # (sym_dim,)  → (1,sym_dim)
+        if sym_tensor.ndim == 1:              # (sym_dim,) → (1,sym_dim)
             sym_tensor = sym_tensor.unsqueeze(0)
 
         if self.fusion_type == "concat":
             fused = torch.cat([latent, sym_tensor.float()], dim=1)
 
         else:  # gated
-            if self._sym_dim_init == -1 and self.gate_fc[0].in_features == 1:
-                self._maybe_init_gate(sym_tensor.size(1), latent.device, latent.dtype)
+            # lazily build gate_fc when sym_dim was unknown
+            if self.sym_dim_init == -1 and self.gate_fc[0].in_features == 1:
+                self._maybe_init_gate(sym_tensor.size(1),
+                                      latent.device, latent.dtype)
 
-            gate = self.gate_fc(sym_tensor.float())          # (B, seq_dim)
-            fused = latent * gate                            # element-wise gating
+            gate = self.gate_fc(sym_tensor.float())   # (B, seq_dim)
+            fused = latent * gate                     # element-wise gating
 
         logits = self.classifier(fused)
-
         return (fused, logits) if return_latent else logits
+
 
     # ----------------------------------------------------------------
     def get_output_dim(self) -> int:
