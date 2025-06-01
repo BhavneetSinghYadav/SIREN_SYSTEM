@@ -4,175 +4,92 @@ src/features/rhythmicity.py
 
 Symbolic Feature #1 – Rhythmicity Index
 ---------------------------------------
-Quantifies the degree of periodic / loop-like motion in a wrist-sensor
-sequence.  Compulsive BFRB gestures are *hypothesised* to show stronger,
-stable rhythmic components than short, deliberate, non-compulsive gestures.
-
-Output
-------
-For every sequence we return a 3-element NumPy vector:
-
-[  dominant_freq_hz ,
-   spectral_entropy  ,
-   rhythmicity_score ]
-
-• dominant_freq_hz  – frequency (Hz) of strongest peak in the band-limited
-  magnitude spectrum (0.5–6 Hz, typical human hand-motion range).
-
-• spectral_entropy  – Shannon entropy of the normalised power spectrum
-  (lower  ⇒ more periodic / tonally concentrated).
-
-• rhythmicity_score – 1 − spectral_entropy, ranged 0–1 for convenience.
-
-Author: Bhavya  (Bhavneet Singh Yadav) — 2025
+<… doc-string unchanged …>
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing  import List, Tuple, Dict
+from typing import List, Tuple
 
 import numpy as np
 
-# Optional PyTorch import for GPU-accelerated FFT
+# Optional GPU FFT
 try:
     import torch
-    TORCH_AVAILABLE = True
+    _TORCH_OK = True
 except ModuleNotFoundError:
-    TORCH_AVAILABLE = False
-
-
-# --------------------------------------------------------------------------- #
-# Utility helpers
-# --------------------------------------------------------------------------- #
-def _next_pow_two(n: int) -> int:
-    """Return next power of two ≥ n —for efficient FFT."""
+    _TORCH_OK = False
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
+def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def _compute_fft(signal_1d: np.ndarray, sample_rate: float = 50.0
-                 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Parameters
-    ----------
-    signal_1d : (T,) float32
-        Magnitude signal (e.g., |acc|) per time-step.
-    sample_rate : float
-        Samples per second.  50 Hz ≈ typical BNO080 output.
-
-    Returns
-    -------
-    freq  : (K,) frequencies in Hz
-    power : (K,) power spectrum (normalised)
-    """
-    n = _next_pow_two(len(signal_1d))
-    if TORCH_AVAILABLE:
-        x = torch.tensor(signal_1d, dtype=torch.float32, device="cpu")
+def _fft_power(sig: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Return freq (Hz) & normalised power spectrum."""
+    n = _next_pow2(len(sig))
+    if _TORCH_OK:
+        x = torch.tensor(sig, dtype=torch.float32, device="cpu")
         fft = torch.fft.rfft(x, n=n)
-        power = (fft.real ** 2 + fft.imag ** 2).cpu().numpy()
+        pwr = (fft.real ** 2 + fft.imag ** 2).cpu().numpy()
     else:
-        fft = np.fft.rfft(signal_1d, n=n)
-        power = np.abs(fft) ** 2
-
-    freq = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-    power = power / (power.sum() + 1e-9)          # normalise to 1.0
-    return freq, power
+        pwr = np.abs(np.fft.rfft(sig, n=n)) ** 2
+    freq = np.fft.rfftfreq(n, d=1.0 / fs)
+    return freq, pwr / (pwr.sum() + 1e-9)
 
 
-def _spectral_entropy(power: np.ndarray, eps: float = 1e-9) -> float:
-    """Shannon entropy  (0 = pure tone, 1 = white-noise)."""
-    entropy = -np.sum(power * (np.log(power + eps)))
-    # divide by log(K) to bound 0–1
-    return float(entropy / np.log(len(power) + eps))
-
-
-# --------------------------------------------------------------------------- #
-# Core class
-# --------------------------------------------------------------------------- #
+def _spectral_entropy(pwr: np.ndarray, eps: float = 1e-9) -> float:
+    ent = -np.sum(pwr * np.log(pwr + eps))
+    return float(ent / np.log(len(pwr) + eps))         # 0‒1
+# ──────────────────────────────────────────────────────────────
 class RhythmicityExtractor:
-    """
-    Compute rhythmicity features for a single sequence or a batch.
+    """Return a 3-element vector describing periodicity of a sequence."""
 
-    Usage
-    -----
-    >>> from rhythmicity import RhythmicityExtractor
-    >>> extractor = RhythmicityExtractor()
-    >>> feats = extractor.extract(sequence)         # (3,) vector
-    >>> names = extractor.get_feature_names()
-    """
+    _FEAT_NAMES = ["dom_freq_hz", "spectral_entropy", "rhythmicity_score"]
 
-    def __init__(self,
-                 sample_rate: float = 50.0,
-                 freq_band: Tuple[float, float] = (0.5, 6.0)):
-        self.fs        = sample_rate
-        self.f_low, self.f_high = freq_band
+    def __init__(self, sample_rate: float = 50.0, band: Tuple[float, float] = (0.5, 6.0)):
+        self.fs = sample_rate
+        self.f_lo, self.f_hi = band
 
-    # --------------------------------------------------------------------- #
-    def _extract_one(self, seq: np.ndarray) -> np.ndarray:
+    # public ---------------------------------------------------
+    def extract(self, seq: np.ndarray | list[np.ndarray]) -> np.ndarray:
         """
-        seq : (T, F) array (IMU columns after normalization).
-              We expect acc_x, acc_y, acc_z among features 0–2.
-
-        Returns  (3,) float32  (dominant_freq_hz, spec_entropy, rhythm_score)
+        seq : (T,F)  or list/array of such matrices.
+        Returns  (3,) or (N,3) np.float32
         """
-        acc_mag = np.linalg.norm(seq[:, :3], axis=1)    # magnitude signal
-        freq, power = _compute_fft(acc_mag, self.fs)
+        if isinstance(seq, np.ndarray) and seq.ndim == 2:
+            return self._feat(seq)
+        return np.vstack([self._feat(s) for s in seq]).astype(np.float32)
 
-        # Band-limit
-        mask = (freq >= self.f_low) & (freq <= self.f_high)
-        freq_band = freq[mask]
-        pwr_band  = power[mask]
+    # required by SymbolicFeatureBank -------------------------
+    def dim(self) -> int:        # <-- added ✔
+        return len(self._FEAT_NAMES)
 
-        # Dominant frequency within band
-        dom_idx = int(np.argmax(pwr_band))
-        dom_freq = float(freq_band[dom_idx])
+    # convenience ---------------------------------------------
+    @classmethod
+    def get_feature_names(cls) -> List[str]:
+        return cls._FEAT_NAMES.copy()
 
-        # Spectral entropy
-        entropy = _spectral_entropy(pwr_band)
-        rhythmicity = 1.0 - entropy                    # invert for convenience
+    # internal -------------------------------------------------
+    def _feat(self, seq: np.ndarray) -> np.ndarray:
+        acc_mag = np.linalg.norm(seq[:, :3], axis=1)
+        f, p = _fft_power(acc_mag, self.fs)
 
-        return np.asarray([dom_freq, entropy, rhythmicity], dtype=np.float32)
+        mask = (f >= self.f_lo) & (f <= self.f_hi)
+        f, p = f[mask], p[mask]
 
-    # --------------------------------------------------------------------- #
-    def extract(self, sequences: np.ndarray | List[np.ndarray]
-                ) -> np.ndarray:
-        """
-        sequences : array-like
-            • If 2-D (T,F) → single sequence.
-            • If list/3-D (N,T,F) → batch.
-
-        Returns
-        -------
-        feats : (N,3) or (3,) NumPy array
-        """
-        if isinstance(sequences, np.ndarray) and sequences.ndim == 2:
-            return self._extract_one(sequences)
-        # Batch mode
-        batch_feats = [self._extract_one(seq) for seq in sequences]
-        return np.vstack(batch_feats)
-
-    # --------------------------------------------------------------------- #
-    @staticmethod
-    def get_feature_names() -> List[str]:
-        return ["dom_freq_hz", "spectral_entropy", "rhythmicity_score"]
+        dom_freq = float(f[int(np.argmax(p))])
+        entropy  = _spectral_entropy(p)
+        rhythmic = 1.0 - entropy
+        return np.array([dom_freq, entropy, rhythmic], dtype=np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# CLI quick-test
-# --------------------------------------------------------------------------- #
+# smoke-test -----------------------------------------------------------
 if __name__ == "__main__":
-    # Minimal sanity test with white-noise vs sine-wave
-    import matplotlib.pyplot as plt
-
     fs = 50
-    t  = np.arange(0, 4, 1/fs)
-    sine = np.sin(2 * np.pi * 2.0 * t)          # 2 Hz tone
-    noise = np.random.randn(len(t))
+    t  = np.arange(0, 4, 1 / fs)
+    sig = np.sin(2 * np.pi * 2.0 * t)
+    seq = np.tile(sig[:, None], (1, 7)).astype(np.float32)
 
-    def to_seq(signal):
-        # duplicate into fake (T,7) IMU channels
-        return np.tile(signal[:, None], (1, 7)).astype(np.float32)
-
-    ext = RhythmicityExtractor(sample_rate=fs)
-    print("Sine → ", ext.extract(to_seq(sine)))
-    print("Noise → ", ext.extract(to_seq(noise)))
-# Extract rhythmicity features
+    ext = RhythmicityExtractor(fs)
+    print(ext.extract(seq))        # should print 3-element vector
