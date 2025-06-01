@@ -1,0 +1,3 @@
+model:
+  type: fusion
+  dropout: 0.3
