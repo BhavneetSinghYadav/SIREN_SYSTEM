@@ -1,149 +1,123 @@
 """
-src/models/fusion_net.py
-~~~~~~~~~~~~~~~~~~~~~~~~
+src/models/fusion_net.py  ·  v1.2
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Fusion network that merges:
-  • Learned latent embedding from a sequence encoder   (e.g., CNNEncoder)
-  • Symbolic feature vector (e.g., rhythmicity, posture, tremor_entropy)
+Fusion network that merges
+  • sequence latent  (B, seq_dim)
+  • symbolic vector  (B, sym_dim)
 
-Workflow
---------
-latent_seq = sequence_encoder(seq)          # (B, seq_dim)
-x_sym      = symbolic_vector                # (B, sym_dim)  (can be empty)
-fusion     = [latent_seq | x_sym]           # concat
-logits     = classifier(fusion)             # (B, n_classes)
-
-Compatible with the SIREN project coding contract.
-
-Author : Bhavya  — 2025
+New in v1.2
+-----------
+* supports  ``fusion_type = {"concat","gated"}``
+* auto-detects sym_dim from first batch if set to -1
 """
 
+from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# Helper : simple MLP head
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 class _MLPHead(nn.Module):
-    def __init__(self,
-                 in_dim: int,
-                 hidden: int = 128,
-                 n_classes: int = 18,
-                 dropout: float = 0.25):
+    def __init__(self, in_dim: int, n_classes: int, dropout: float = 0.3):
         super().__init__()
+        h = max(64, in_dim // 2)
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.Linear(in_dim, h),
+            nn.BatchNorm1d(h),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden, n_classes)
+            nn.Linear(h, n_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# FusionNet
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 class FusionNet(nn.Module):
-    """
-    Parameters
-    ----------
-    sequence_encoder : nn.Module
-        Any module with  (latent, ...) = forward(seq, return_logits=False)
-        and  .get_output_dim()
-    sym_dim : int
-        Dimensionality of the symbolic feature vector.
-        If 0 ⇒ model treats input as IMU-only.
-    n_classes : int
-        Output gesture classes.
-    """
-
-    def __init__(self,
-                 sequence_encoder: nn.Module,
-                 sym_dim: int = 3,
-                 n_classes: int = 18):
+    def __init__(
+        self,
+        sequence_encoder: nn.Module,
+        sym_dim: int = -1,                # -1 → infer at runtime
+        n_classes: int = 18,
+        fusion_type: str = "concat",      # "concat" | "gated"
+    ):
         super().__init__()
+        assert fusion_type in {"concat", "gated"}
+        self.encoder      = sequence_encoder
+        self.sym_dim_init = sym_dim
+        self._sym_dim     = sym_dim       # may update after first forward
+        self.fusion_type  = fusion_type
 
-        self.encoder  = sequence_encoder
-        self.sym_dim  = sym_dim
-        self.seq_dim  = self.encoder.get_output_dim()
-        self.fused_dim = self.seq_dim + sym_dim
+        self.seq_dim   = self.encoder.get_output_dim()
+        fused_dim      = self.seq_dim if fusion_type == "gated" else self.seq_dim + sym_dim
+        self.classifier = _MLPHead(fused_dim, n_classes)
 
-        self.classifier = _MLPHead(
-            in_dim=self.fused_dim,
-            hidden=max(64, self.fused_dim // 2),
-            n_classes=n_classes,
-            dropout=0.3,
-        )
+        if fusion_type == "gated":
+            # gate: symbolic → [0,1] sigmoid weights on latent dim
+            self.gate_fc = nn.Sequential(
+                nn.Linear(self._sym_dim if self._sym_dim > 0 else 1, self.seq_dim),
+                nn.Sigmoid()
+            )
 
-    # ------------------------------------------------------------------ #
-    def forward(self,
-                seq_tensor: torch.Tensor,
-                sym_tensor: Optional[torch.Tensor] = None,
-                return_latent: bool = False
-                ) -> Tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
-        """
-        Parameters
-        ----------
-        seq_tensor : (B, T, F) or (T, F) torch.Tensor
-        sym_tensor : (B, sym_dim) or (sym_dim,) or None
-            Symbolic features *per sequence*.  If None or sym_dim == 0,
-            an all-zeros placeholder is concatenated.
-        return_latent : bool
-            If True → returns (fused_latent, logits)
-            else       returns logits only.
+    # ──────────────────────────────────────────────────────────
+    def _maybe_init_gate(self, sym_dim: int, device, dtype):
+        """Lazy-create gate_fc at first call when sym_dim was unknown."""
+        if self.gate_fc[0].in_features == 1:       # placeholder
+            self._sym_dim = sym_dim
+            self.gate_fc = nn.Sequential(
+                nn.Linear(sym_dim, self.seq_dim),
+                nn.Sigmoid()
+            ).to(device=device, dtype=dtype)
 
-        Returns
-        -------
-        logits : (B, n_classes)
-        or (latent, logits)
-        """
-        latent_seq = self.encoder(seq_tensor, return_logits=False)  # (B, seq_dim)
+    # ──────────────────────────────────────────────────────────
+    def forward(
+        self,
+        seq_tensor: torch.Tensor,            # (B,T,F)
+        sym_tensor: Optional[torch.Tensor] = None,
+        return_latent: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
 
-        # Ensure batch shape for sym features
-        if self.sym_dim == 0 or sym_tensor is None:
-            # create zero placeholder (no symbolic features)
-            sym = torch.zeros(latent_seq.size(0), 0,
-                              device=latent_seq.device, dtype=latent_seq.dtype)
-        else:
-            # Handle (sym_dim,) → (1, sym_dim)
-            if sym_tensor.ndim == 1:
-                sym_tensor = sym_tensor.unsqueeze(0)
-            sym = sym_tensor.float()
+        latent = self.encoder(seq_tensor, return_logits=False)   # (B, seq_dim)
 
-        fused = torch.cat([latent_seq, sym], dim=1)                 # (B, fused_dim)
+        # -------- symbolic handling ----------------------------------
+        if sym_tensor is None:
+            sym_tensor = torch.zeros(latent.size(0), 0,
+                                     device=latent.device, dtype=latent.dtype)
+
+        if sym_tensor.ndim == 1:        # (sym_dim,)  → (1,sym_dim)
+            sym_tensor = sym_tensor.unsqueeze(0)
+
+        if self.fusion_type == "concat":
+            fused = torch.cat([latent, sym_tensor.float()], dim=1)
+
+        else:  # gated
+            if self._sym_dim_init == -1 and self.gate_fc[0].in_features == 1:
+                self._maybe_init_gate(sym_tensor.size(1), latent.device, latent.dtype)
+
+            gate = self.gate_fc(sym_tensor.float())          # (B, seq_dim)
+            fused = latent * gate                            # element-wise gating
+
         logits = self.classifier(fused)
 
-        if return_latent:
-            return fused, logits
-        return logits
+        return (fused, logits) if return_latent else logits
 
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------
     def get_output_dim(self) -> int:
-        """Return fused latent dimensionality."""
-        return self.fused_dim
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Smoke-test
-# ──────────────────────────────────────────────────────────────────────────
+        """Dimension of the vector fed into `classifier` (for downstream use)."""
+        if self.fusion_type == "concat":
+            return self.seq_dim + self._sym_dim
+        return self.seq_dim
+# ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    from cnn_encoder import CNNEncoder   # local relative import when run directly
+    from models.transformer_encoder import TransformerEncoder
+    B, T, F, S = 3, 200, 332, 16
+    seq = torch.randn(B, T, F)
+    sym = torch.randn(B, S)
 
-    B, T, F = 4, 200, 7
-    seq     = torch.randn(B, T, F)
-    sym     = torch.randn(B, 3)          # rhythmicity, posture, tremor
+    enc = TransformerEncoder(in_channels=F, n_classes=18, latent_dim=128)
+    net = FusionNet(enc, sym_dim=S, n_classes=18, fusion_type="gated")
 
-    cnn   = CNNEncoder(in_channels=F, n_classes=18, latent_dim=128)
-    model = FusionNet(cnn, sym_dim=3, n_classes=18)
-
-    fused, logits = model(seq, sym, return_latent=True)
-    print("fused shape :", fused.shape)   # (4, 131)
-    print("logits shape:", logits.shape)  # (4, 18)
-# Fusion model of symbolic and neural features
+    lat, log = net(seq, sym, return_latent=True)
+    print("latent", lat.shape, "logits", log.shape)
