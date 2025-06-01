@@ -43,14 +43,24 @@ PAD_VALUE        = 0.0
 def _pad_or_crop(arr: np.ndarray,
                  target_len: int = DEFAULT_SEQ_LEN,
                  pad_value: float = PAD_VALUE) -> np.ndarray:
-    """Pad with `pad_value` or crop to fixed length along axis=0."""
+    """
+    Pad with `pad_value` or crop to fixed length along axis=0.
+
+    • If the sequence is longer than `target_len`, we KEEP the **last**
+      `target_len` timesteps (gesture likely near the end of each sequence).
+    • If shorter, we pad *symmetrically* (same as before).
+    """
     length = arr.shape[0]
+
+    # Exact match ── nothing to do
     if length == target_len:
         return arr
-    if length > target_len:           # crop centre
-        start = (length - target_len) // 2
-        return arr[start: start + target_len]
-    # length < target_len  → pad at both ends
+
+    # CROP ── keep tail
+    if length > target_len:
+        return arr[-target_len:]            # last N frames
+
+    # PAD ── fill both sides
     pad_total = target_len - length
     pad_left  = pad_total // 2
     pad_right = pad_total - pad_left
