@@ -2,14 +2,14 @@
 src/data/preprocessing.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-One-shot dataset cleaner for the SIREN project.
+Multimodal dataset cleaner for the SIREN project (v0.3).
 
-• Reads raw train/test CSVs
-• Cleans NaNs / Infs  → 0.0
-• Z-scores IMU columns per sequence
-• Tail-crops or symmetric-pads to fixed length
-• Encodes gesture strings → int IDs
-• Writes cleaned CSVs + label_map.json
+Upgrades from the previous IMU‑only version:
+  • Supports **Thermopile** (5 cols) & **ToF** (5×64 = 320 cols)
+  • Handles ToF missing value -1 → 0
+  • Z‑scores **all** sensor columns per sequence
+  • Pads / crops to fixed SEQ_LEN
+  • Writes *_processed.csv with **full 332‑D** frame vectors + gesture_id
 
 Run via scripts/preprocess_data.py
 """
@@ -25,13 +25,18 @@ IMU_COLUMNS = [
     "acc_x", "acc_y", "acc_z",
     "rot_w", "rot_x", "rot_y", "rot_z",
 ]
-SEQ_LEN = 200
-PAD_VALUE = 0.0
+THERMO_COLUMNS = [f"thm_{i}" for i in range(1, 6)]  # 5 temps
+TOF_COLUMNS    = [f"tof_{s}_v{v}" for s in range(1, 6) for v in range(64)]  # 320
 
+ALL_COLUMNS = IMU_COLUMNS + THERMO_COLUMNS + TOF_COLUMNS
+
+SEQ_LEN   = 200
+PAD_VALUE = 0.0
+MISSING_TOF = -1  # sentinel in raw csv
 
 # ------------------------- helper functions --------------------------
+
 def _pad_or_crop(arr: np.ndarray, target_len: int = SEQ_LEN) -> np.ndarray:
-    """Tail-crop if long, symmetric-pad if short."""
     n = arr.shape[0]
     if n == target_len:
         return arr
@@ -40,32 +45,27 @@ def _pad_or_crop(arr: np.ndarray, target_len: int = SEQ_LEN) -> np.ndarray:
     pad = target_len - n
     left = pad // 2
     right = pad - left
-    return np.pad(arr, ((left, right), (0, 0)),
-                  mode="constant", constant_values=PAD_VALUE)
+    return np.pad(arr, ((left, right), (0, 0)), mode="constant", constant_values=PAD_VALUE)
 
 
-def _zscore(x: np.ndarray, eps=1e-6) -> np.ndarray:
+def _zscore(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     mu = x.mean(axis=0, keepdims=True)
     std = np.clip(x.std(axis=0, keepdims=True), eps, None)
     return (x - mu) / std
 
 
-def clean_split(raw_csv: Path,
-                out_csv: Path,
-                label_map: dict[str, int] | None,
-                is_train: bool):
+def clean_split(raw_csv: Path, out_csv: Path, label_map: dict[str, int] | None, is_train: bool):
     """Process one split (train or test)."""
     df = pd.read_csv(raw_csv)
 
-    # keep relevant columns
-    keep = ["sequence_id", "sequence_counter", *IMU_COLUMNS]
+    keep = ["sequence_id", "sequence_counter", *ALL_COLUMNS]
     if is_train:
         keep.append("gesture")
     df = df[keep]
 
     # gesture → int mapping
     if is_train:
-        if label_map is None:       # first time
+        if label_map is None:
             unique = sorted(df["gesture"].unique())
             label_map = {g: i for i, g in enumerate(unique)}
         df["gesture_id"] = df["gesture"].map(label_map)
@@ -74,13 +74,21 @@ def clean_split(raw_csv: Path,
 
     for seq_id, grp in df.groupby("sequence_id"):
         grp = grp.sort_values("sequence_counter")
-        imu = grp[IMU_COLUMNS].to_numpy(np.float32)
-        imu = np.nan_to_num(imu, nan=0.0, posinf=0.0, neginf=0.0)
-        imu = _zscore(imu)
-        imu = _pad_or_crop(imu)
+        X = grp[ALL_COLUMNS].to_numpy(np.float32)  # (T, 332)
 
-        proc = pd.DataFrame(
-            imu, columns=[f"imu_{c}" for c in IMU_COLUMNS])
+        # --- clean ---
+        # 1) missing ToF -1 → 0
+        X[:, len(IMU_COLUMNS)+len(THERMO_COLUMNS):][X[:, len(IMU_COLUMNS)+len(THERMO_COLUMNS):] == MISSING_TOF] = 0.0
+        # 2) nan/inf → 0
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 3) per-sequence z‑score
+        X = _zscore(X)
+
+        # 4) pad/crop
+        X = _pad_or_crop(X)
+
+        proc = pd.DataFrame(X, columns=ALL_COLUMNS)
         proc.insert(0, "sequence_id", seq_id)
         if is_train:
             gid = label_map[grp["gesture"].iloc[0]]
@@ -91,16 +99,9 @@ def clean_split(raw_csv: Path,
     out_df.to_csv(out_csv, index=False)
     return label_map
 
-
 # ---------------------- public entry-point ---------------------------
-def run_preprocessing(data_dir: str | Path,
-                      out_dir: str | Path):
-    """
-    Parameters
-    ----------
-    data_dir : folder containing raw train/test CSVs.
-    out_dir  : destination for processed CSVs + label_map.json
-    """
+
+def run_preprocessing(data_dir: str | Path, out_dir: str | Path):
     data_dir = Path(data_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -111,15 +112,16 @@ def run_preprocessing(data_dir: str | Path,
         raw_csv=data_dir / "train.csv",
         out_csv=out_dir / "train_processed.csv",
         label_map=label_map,
-        is_train=True)
+        is_train=True,
+    )
 
     _ = clean_split(
         raw_csv=data_dir / "test.csv",
         out_csv=out_dir / "test_processed.csv",
         label_map=label_map,
-        is_train=False)
+        is_train=False,
+    )
 
-    # save mapping for loader or inference
     with open(out_dir / "label_map.json", "w") as jf:
         json.dump(label_map, jf, indent=2)
 
@@ -129,9 +131,8 @@ def run_preprocessing(data_dir: str | Path,
 # ----------------------------- CLI -----------------------------------
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Preprocess BFRB dataset")
-    parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--out_dir", required=True)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Preprocess multimodal BFRB dataset")
+    p.add_argument("--data_dir", required=True)
+    p.add_argument("--out_dir", required=True)
+    args = p.parse_args()
     run_preprocessing(args.data_dir, args.out_dir)
-# Data normalization and alignment
