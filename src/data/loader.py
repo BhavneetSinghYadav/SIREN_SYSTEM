@@ -2,67 +2,49 @@
 src/data/loader.py
 ~~~~~~~~~~~~~~~~~~
 
-Data-loading utilities for the SIREN project.
+Stable dataloader for SIREN.
 
-• Loads `train.csv` / `test.csv`
-• Groups rows by `sequence_id`
-• Normalises IMU values
-• Returns (sequence_tensor, label) pairs via a PyTorch-style Dataset
-
-Author: Bhavya (BhavneetSinghYadav) – 2025
+Key improvements (v0.2)
+-----------------------
+• Encodes string gesture labels -> int IDs (self.label2idx)
+• Returns labels as plain int; collate_fn tensor-ises later
+• Sorts rows by `sequence_counter`
+• Works for both train / test splits without crash
 """
 
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Optional PyTorch import (fallback to NumPy arrays if unavailable)
 try:
     import torch
     TORCH_AVAILABLE = True
 except ModuleNotFoundError:
     TORCH_AVAILABLE = False
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Config ──────────────────────────
 IMU_COLUMNS = [
     "acc_x", "acc_y", "acc_z",
     "rot_w", "rot_x", "rot_y", "rot_z",
 ]
-DEFAULT_SEQ_LEN = 200           # Fixed length after padding / cropping
-PAD_VALUE        = 0.0
+DEFAULT_SEQ_LEN = 200
+PAD_VALUE = 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Helper functions
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────── Helper functions ────────────────────
 def _pad_or_crop(arr: np.ndarray,
                  target_len: int = DEFAULT_SEQ_LEN,
                  pad_value: float = PAD_VALUE) -> np.ndarray:
-    """
-    Pad with `pad_value` or crop to fixed length along axis=0.
-
-    • If the sequence is longer than `target_len`, we KEEP the **last**
-      `target_len` timesteps (gesture likely near the end of each sequence).
-    • If shorter, we pad *symmetrically* (same as before).
-    """
+    """Tail-crop or symmetric-pad to fixed length."""
     length = arr.shape[0]
-
-    # Exact match ── nothing to do
     if length == target_len:
         return arr
-
-    # CROP ── keep tail
     if length > target_len:
-        return arr[-target_len:]            # last N frames
-
-    # PAD ── fill both sides
+        return arr[-target_len:]
     pad_total = target_len - length
-    pad_left  = pad_total // 2
+    pad_left = pad_total // 2
     pad_right = pad_total - pad_left
     return np.pad(arr, ((pad_left, pad_right), (0, 0)),
                   mode="constant",
@@ -70,36 +52,26 @@ def _pad_or_crop(arr: np.ndarray,
 
 
 def _zscore(seq: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Simple z-score normalisation along the time axis."""
     mean = seq.mean(axis=0, keepdims=True)
-    std  = seq.std(axis=0, keepdims=True) + eps
+    std = seq.std(axis=0, keepdims=True) + eps
     return (seq - mean) / std
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Core dataset
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────── Dataset ──────────────────────────
 class SequenceDataset:
     """
-    Minimal sequence-level dataset (PyTorch-compatible).
+    Sequence-level dataset.
 
-    Parameters
-    ----------
-    csv_path : str | Path
-        Path to train.csv or test.csv.
-    mode : {"train", "test"}
-        Determines whether labels are returned.
-    seq_len : int
-        Fixed length for all sequences after padding / cropping.
-    use_torch : bool
-        If True (and PyTorch available) → returns torch.Tensor objects.
-
-    Yields
-    ------
-    X : (seq_len, num_features) array/torch.Tensor
-    y : int | None
+    Returns
+    -------
+    x : torch.Tensor | np.ndarray  shape (T,F)
+    y : int | None                 gesture id
     seq_id : str
     """
+
+    # class-wide label mapping (shared by train & test)
+    label2idx: Dict[str, int] = {}
+
     def __init__(self,
                  csv_path: str | Path,
                  mode: str = "train",
@@ -107,83 +79,66 @@ class SequenceDataset:
                  use_torch: bool = True):
 
         assert mode in {"train", "test"}
-        self.csv_path  = Path(csv_path)
-        self.mode      = mode
-        self.seq_len   = seq_len
+        self.mode = mode
+        self.seq_len = seq_len
         self.use_torch = TORCH_AVAILABLE and use_torch
 
-        print(f"[loader] reading {self.csv_path.name} …")
-        df = pd.read_csv(self.csv_path)
+        df = pd.read_csv(csv_path)
 
-        # Keep only IMU columns for v0
-        cols_required = ["sequence_id", *IMU_COLUMNS]
+        # keep only IMU + id + gesture
+        cols = ["sequence_id", "sequence_counter", *IMU_COLUMNS]
         if mode == "train":
-            cols_required.append("gesture")
-        df = df[cols_required]
+            cols.append("gesture")
+        df = df[cols]
 
-        # Group rows by sequence_id → NumPy array (timesteps, features)
-        grouped: Dict[str, np.ndarray] = {}
-        labels:  Dict[str, int]        = {}
+        # create label map once
+        if mode == "train" and not SequenceDataset.label2idx:
+            unique = sorted(df["gesture"].unique())
+            SequenceDataset.label2idx = {g: i for i, g in enumerate(unique)}
+
+        grouped = {}
+        labels = {}
 
         for seq_id, grp in df.groupby("sequence_id"):
-            imu_seq = grp[IMU_COLUMNS].to_numpy(dtype=np.float32)
-            imu_seq = _zscore(imu_seq)               # normalise per-sequence
-            imu_seq = _pad_or_crop(imu_seq, seq_len) # fixed length
-            grouped[seq_id] = imu_seq
+            grp = grp.sort_values("sequence_counter")
+            imu = grp[IMU_COLUMNS].to_numpy(np.float32)
+            imu = _zscore(imu)
+            imu = _pad_or_crop(imu, seq_len)
+            grouped[seq_id] = imu
             if mode == "train":
-                # gesture column is constant within a sequence
-                labels[seq_id]  = grp["gesture"].iloc[0]
+                gstr = grp["gesture"].iloc[0]
+                labels[seq_id] = SequenceDataset.label2idx[gstr]
 
         self.seq_ids = sorted(grouped.keys())
-        self.X       = grouped
-        self.y       = labels if mode == "train" else None
+        self.X = grouped
+        self.y = labels if mode == "train" else None
 
-    # PyTorch-style helpers ------------------------------------------------
+    # ------------------- PyTorch helpers --------------------
     def __len__(self):
         return len(self.seq_ids)
 
     def __getitem__(self, idx: int) -> Tuple:
-        seq_id = self.seq_ids[idx]
-        x = self.X[seq_id]                         # (seq_len, features)
+        sid = self.seq_ids[idx]
+        x = self.X[sid]
         if self.use_torch:
             x = torch.tensor(x, dtype=torch.float32)
 
         if self.mode == "train":
-            y = self.y[seq_id]
-            if self.use_torch:
-                y = torch.tensor(y, dtype=torch.long)
-            return x, y, seq_id
-        return x, None, seq_id
+            y = self.y[sid]          # plain int
+            return x, y, sid
+        return x, None, sid
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Convenience factory
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────── Convenience factory ──────────────────
 def get_dataset(data_dir: str | Path,
                 split: str = "train",
                 **kwargs) -> SequenceDataset:
-    """
-    Return SequenceDataset for 'train' or 'test'.
-
-    Examples
-    --------
-    >>> train_ds = get_dataset("../data/raw", split="train")
-    >>> x, y, sid = train_ds[0]
-    """
     csv_file = "train.csv" if split == "train" else "test.csv"
-    csv_path = Path(data_dir) / csv_file
-    return SequenceDataset(csv_path, mode=split, **kwargs)
+    return SequenceDataset(Path(data_dir) / csv_file,
+                           mode=split, **kwargs)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Debug CLI
-# ──────────────────────────────────────────────────────────────────────────
+# ------------------------ Debug run -------------------------
 if __name__ == "__main__":
-    # Quick sanity check from command line:
-    # $ python -m src.data.loader ../data/raw train
-    import sys
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("../../data/raw")
-    split = sys.argv[2] if len(sys.argv) > 2 else "train"
-    ds = get_dataset(root, split=split, use_torch=False)
-    print(f"Loaded {len(ds)} sequences ⇢ shape[0]: {ds[0][0].shape}")
-# Data loading logic
+    ds = get_dataset("../../data/raw", split="train", use_torch=False)
+    print("N =", len(ds), " first sample ", ds[0][:2])
