@@ -43,9 +43,11 @@ class FusionNet(nn.Module):
 
     Parameters
     ----------
-    sequence_encoder : nn.Module
-        Must implement `forward(seq) -> Tensor` **and** `get_output_dim()`.
-        The forward may return either `(B, seq_dim)` or `(B, T, seq_dim)`.
+        sequence_encoder : nn.Module | None
+            Must implement `forward(seq) -> Tensor` **and** `get_output_dim()`.
+            The forward may return either `(B, seq_dim)` or `(B, T, seq_dim)`.
+            If ``None``, ``input_dim`` must be provided and ``FusionNet`` acts
+            purely as a classifier over pre-fused sensor vectors.
     sym_dim : int, default ``-1``
         Dimensionality of the symbolic vector.  ``-1`` → infer on the first call.
     n_classes : int, default ``18``
@@ -59,8 +61,9 @@ class FusionNet(nn.Module):
 
     def __init__(
         self,
-        sequence_encoder: nn.Module,
+        sequence_encoder: nn.Module | None = None,
         *,
+        input_dim: int | None = None,
         sym_dim: int = -1,
         n_classes: int = 18,
         fusion_type: str = "concat",
@@ -69,27 +72,32 @@ class FusionNet(nn.Module):
         super().__init__()
         assert fusion_type in {"concat", "gated"}, "fusion_type must be 'concat' or 'gated'"
         assert pool in {"mean", "cls"}, "pool must be 'mean' or 'cls'"
+        assert sequence_encoder is not None or input_dim is not None, "Provide encoder or input_dim"
 
         self.encoder = sequence_encoder
-        self.seq_dim: int = sequence_encoder.get_output_dim()
-
-        # ----- symbolic meta -----
-        self.sym_dim_init = sym_dim  # user‑provided value (may be -1)
-        self._sym_dim: int = max(1, sym_dim)  # placeholder ≥1 to build layers
-
-        self.fusion_type = fusion_type
         self.pool = pool
+        self.fusion_type = fusion_type
 
-        # ----- gating & classifier -----
-        if fusion_type == "gated":
-            self.gate_fc = nn.Sequential(
-                nn.Linear(self._sym_dim, self.seq_dim),
-                nn.Sigmoid(),
-            )
-            fused_dim = self.seq_dim  # gating preserves dim
-        else:  # concat
+        if sequence_encoder is not None:
+            self.seq_dim = sequence_encoder.get_output_dim()
+            self.sym_dim_init = sym_dim  # user‑provided value (may be -1)
+            self._sym_dim = max(1, sym_dim)
+
+            if fusion_type == "gated":
+                self.gate_fc = nn.Sequential(
+                    nn.Linear(self._sym_dim, self.seq_dim),
+                    nn.Sigmoid(),
+                )
+                fused_dim = self.seq_dim
+            else:
+                self.gate_fc = None
+                fused_dim = self.seq_dim + self._sym_dim
+        else:
+            self.seq_dim = int(input_dim)
+            self.sym_dim_init = 0
+            self._sym_dim = 0
             self.gate_fc = None
-            fused_dim = self.seq_dim + self._sym_dim  # may be wrong for sym_dim=-1 but fixed later
+            fused_dim = self.seq_dim
 
         self.classifier = _MLPHead(fused_dim, n_classes)
 
@@ -129,22 +137,34 @@ class FusionNet(nn.Module):
     # ──────────────────────────────────────────────────────────
     def forward(
         self,
-        seq_tensor: torch.Tensor,
+        seq_tensor: torch.Tensor | None = None,
         sym_tensor: Optional[torch.Tensor] = None,
         *,
+        sensor_latents: Optional[list[torch.Tensor]] = None,
         return_latent: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Parameters
         ----------
-        seq_tensor : Tensor
-            (B, T, C) or (B, C) depending on encoder.
+        seq_tensor : Tensor | None
+            (B, T, C) or (B, C) depending on encoder. Required if ``sensor_latents``
+            is ``None``.
         sym_tensor : Tensor | None
             (B, sym_dim) symbolic vector.  If ``None`` → zeros.
+        sensor_latents : list[Tensor] | None
+            Pre-fused latent vectors from multiple sensors. Overrides ``seq_tensor``
+            if provided.
         return_latent : bool, default False
             Whether to also return fused latent representation.
         """
+
+        if sensor_latents is not None:
+            fused_vec = torch.cat(sensor_latents, dim=1)
+            logits = self.classifier(fused_vec)
+            return (fused_vec, logits) if return_latent else logits
+
+        assert self.encoder is not None, "FusionNet initialized without encoder must use sensor_latents"
 
         # ---------------- encode sequence --------------------
         latent = self.encoder(seq_tensor, return_logits=False)  # (B, T, D) *or* (B, D)
@@ -177,6 +197,8 @@ class FusionNet(nn.Module):
     # ----------------------------------------------------------------
     def get_output_dim(self) -> int:  # noqa: D401 – simple access
         """Return vector dim fed into ``classifier`` (after fusion)."""
+        if self.encoder is None:
+            return self.seq_dim
         if self.fusion_type == "concat":
             return self.seq_dim + self._sym_dim
         return self.seq_dim

@@ -35,6 +35,7 @@ from src.features.feature_bank import SymbolicFeatureBank
 from src.models.cnn_encoder import CNNEncoder
 from src.models.transformer_encoder import TransformerEncoder
 from src.models.fusion_net import FusionNet
+from src.models.symbolic_overlay import SymbolicOverlay
 
 try:
     from tqdm import tqdm
@@ -56,15 +57,36 @@ def set_seed(seed: int = SEED) -> None:
 # Collate fn ─ stacks torch sequences and builds symbolic numpy → torch tensor
 # ----------------------------------------------------------------------------
 
-def collate_fn(batch, bank: SymbolicFeatureBank) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    seqs, labels, _ = zip(*batch)  # list[(T, F)]
+def collate_fn_multi(
+    batch,
+    banks: dict,
+    *,
+    use_imu: bool = True,
+    use_thermo: bool = True,
+    use_tof: bool = True,
+) -> Tuple[dict, dict, torch.Tensor]:
+    """Return per-sensor tensors and symbolic vectors."""
+    seqs, labels, _ = zip(*batch)
     seqs_t = torch.stack(seqs)  # (B, T, F)
     labels_t = torch.as_tensor(labels, dtype=torch.long)
 
-    # symbolic extraction (CPU numpy for feature-bank)
-    sym_np = np.vstack([bank.extract_all(s.cpu().numpy()) for s in seqs_t])
-    sym_t = torch.from_numpy(sym_np).float()
-    return seqs_t, sym_t, labels_t
+    idx = 0
+    seq_parts = {}
+    if use_imu:
+        seq_parts["imu"] = seqs_t[..., idx : idx + len(dl.IMU_COLUMNS)]
+        idx += len(dl.IMU_COLUMNS)
+    if use_thermo:
+        seq_parts["thermo"] = seqs_t[..., idx : idx + len(dl.THERMO_COLUMNS)]
+        idx += len(dl.THERMO_COLUMNS)
+    if use_tof:
+        seq_parts["tof"] = seqs_t[..., idx : idx + len(dl.TOF_COLUMNS)]
+
+    sym_parts = {}
+    for name, bank in banks.items():
+        sym_np = np.vstack([bank.extract_all(s.cpu().numpy()) for s in seqs_t])
+        sym_parts[name] = torch.from_numpy(sym_np).float()
+
+    return seq_parts, sym_parts, labels_t
 
 
 # ----------------------------------------------------------------------------
@@ -114,12 +136,45 @@ def train(args: argparse.Namespace) -> None:
     # Use dataset's active sensor columns so symbolic extraction aligns
     # with the actual feature ordering produced by `SequenceDataset`.
     frame_cols = ds_full.sensor_cols
-    sym_bank = SymbolicFeatureBank(frame_cols)
-    print(f"[INFO] symbolic dim  = {sym_bank.dim()}")
+
+    banks: dict = {
+        "imu": SymbolicFeatureBank(
+            frame_cols,
+            use_rhythm=True,
+            use_thermo=False,
+            use_tof=False,
+            use_tremor=True,
+            use_posture=True,
+        )
+    }
+    if not args.no_thermo:
+        banks["thermo"] = SymbolicFeatureBank(
+            frame_cols,
+            use_rhythm=False,
+            use_thermo=True,
+            use_tof=False,
+            use_tremor=False,
+            use_posture=False,
+        )
+    if not args.no_tof:
+        banks["tof"] = SymbolicFeatureBank(
+            frame_cols,
+            use_rhythm=False,
+            use_thermo=False,
+            use_tof=True,
+            use_tremor=False,
+            use_posture=False,
+        )
 
     common_dl = dict(
         batch_size=args.batch,
-        collate_fn=lambda b: collate_fn(b, sym_bank),
+        collate_fn=lambda b: collate_fn_multi(
+            b,
+            banks,
+            use_imu=True,
+            use_thermo=not args.no_thermo,
+            use_tof=not args.no_tof,
+        ),
         num_workers=0,
         pin_memory=True,
     )
@@ -127,14 +182,42 @@ def train(args: argparse.Namespace) -> None:
     val_loader = DataLoader(ds_val, shuffle=False, **common_dl)
 
     # ---------------- model -------------------
-    encoder = build_encoder(args.model_type, len(frame_cols), num_classes)
+    enc_imu = build_encoder(args.model_type, len(dl.IMU_COLUMNS), num_classes)
+    overlay_imu = SymbolicOverlay(enc_imu.get_output_dim(), banks["imu"].dim(), args.fusion)
+
+    enc_thermo = overlay_thermo = None
+    if not args.no_thermo:
+        enc_thermo = build_encoder(args.model_type, len(dl.THERMO_COLUMNS), num_classes)
+        overlay_thermo = SymbolicOverlay(enc_thermo.get_output_dim(), banks["thermo"].dim(), args.fusion)
+
+    enc_tof = overlay_tof = None
+    if not args.no_tof:
+        enc_tof = build_encoder(args.model_type, len(dl.TOF_COLUMNS), num_classes)
+        overlay_tof = SymbolicOverlay(enc_tof.get_output_dim(), banks["tof"].dim(), args.fusion)
+
+    fusion_dim = overlay_imu.get_output_dim()
+    if overlay_thermo is not None:
+        fusion_dim += overlay_thermo.get_output_dim()
+    if overlay_tof is not None:
+        fusion_dim += overlay_tof.get_output_dim()
+
     model = FusionNet(
-        encoder,
-        sym_dim=sym_bank.dim(),
+        None,
+        input_dim=fusion_dim,
         n_classes=num_classes,
-        fusion_type=args.fusion,
-        pool=args.pool,
     ).to(device)
+    encoders = {
+        "imu": enc_imu.to(device),
+    }
+    overlays = {
+        "imu": overlay_imu.to(device),
+    }
+    if enc_thermo is not None:
+        encoders["thermo"] = enc_thermo.to(device)
+        overlays["thermo"] = overlay_thermo.to(device)
+    if enc_tof is not None:
+        encoders["tof"] = enc_tof.to(device)
+        overlays["tof"] = overlay_tof.to(device)
 
     criterion = nn.CrossEntropyLoss()
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -145,30 +228,53 @@ def train(args: argparse.Namespace) -> None:
 
     # ---------------- loop --------------------
     for epoch in range(1, args.epochs + 1):
-        # ---- train phase ----
         model.train()
         loss_sum = 0.0
-        for b, (seqs, syms, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch:02d}")):
-            seqs, syms, y = seqs.to(device), syms.to(device), y.to(device)
+        for b, (seq_parts, sym_parts, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch:02d}")):
+            y = y.to(device)
+            fused_list = []
 
-            # one-time shape sanity print
+            lat = encoders["imu"](seq_parts["imu"].to(device))
+            fused_list.append(overlays["imu"](lat, sym_parts["imu"].to(device)))
+
+            if not args.no_thermo:
+                lat = encoders["thermo"](seq_parts["thermo"].to(device))
+                fused_list.append(overlays["thermo"](lat, sym_parts["thermo"].to(device)))
+
+            if not args.no_tof:
+                lat = encoders["tof"](seq_parts["tof"].to(device))
+                fused_list.append(overlays["tof"](lat, sym_parts["tof"].to(device)))
+
             if epoch == 1 and b == 0:
-                print("[DEBUG] seqs", seqs.shape, "syms", syms.shape, "labels", y.shape)
+                shapes = [f.shape for f in fused_list]
+                print("[DEBUG] fused shapes", shapes, "labels", y.shape)
 
             optim.zero_grad()
-            logits = model(seqs, syms)
+            logits = model(sensor_latents=fused_list)
             loss = criterion(logits, y)
             loss.backward()
             optim.step()
-            loss_sum += loss.item() * seqs.size(0)
+            loss_sum += loss.item() * y.size(0)
         train_loss = loss_sum / train_len
 
         # ---- validation ----
         model.eval()
         rs = RunningScore(num_classes)
         with torch.no_grad():
-            for seqs, syms, y in val_loader:
-                preds = model(seqs.to(device), syms.to(device)).argmax(1)
+            for seq_parts, sym_parts, y in val_loader:
+                fused_list = []
+                lat = encoders["imu"](seq_parts["imu"].to(device))
+                fused_list.append(overlays["imu"](lat, sym_parts["imu"].to(device)))
+
+                if not args.no_thermo:
+                    lat = encoders["thermo"](seq_parts["thermo"].to(device))
+                    fused_list.append(overlays["thermo"](lat, sym_parts["thermo"].to(device)))
+
+                if not args.no_tof:
+                    lat = encoders["tof"](seq_parts["tof"].to(device))
+                    fused_list.append(overlays["tof"](lat, sym_parts["tof"].to(device)))
+
+                preds = model(sensor_latents=fused_list).argmax(1)
                 rs.update(preds.cpu().numpy(), y.numpy())
         rep = rs.report()
         f1, acc = rep["macro_f1"], rep["accuracy"]
