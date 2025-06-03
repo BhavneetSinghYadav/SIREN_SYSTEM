@@ -1,4 +1,5 @@
-"""Run inference with a trained SIREN meta-fusion model."""
+#!/usr/bin/env python
+"""Run inference with a trained FusionNet model."""
 
 from __future__ import annotations
 
@@ -102,7 +103,7 @@ def run(args: argparse.Namespace) -> None:
         pool=args.pool,
     ).to(device)
 
-    state = torch.load(args.checkpoint, map_location=device)
+    state = torch.load(args.model_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
@@ -142,19 +143,17 @@ def run(args: argparse.Namespace) -> None:
             pred_labels.extend(final_preds)
 
     df = kaggle_submission_df(seq_ids_all, pred_labels, inv_label)
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.output, index=False)
-    print(f"[INFO] wrote {len(df)} predictions to {args.output}")
+    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.out_csv, index=False)
+    print(f"[INFO] wrote {len(df)} predictions to {args.out_csv}")
 
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SIREN inference")
     parser.add_argument("--data-dir", required=True)
-    parser.add_argument(
-        "--checkpoint", required=True, help="Path to .pt model"
-    )
-    parser.add_argument("--output", default="submission.csv")
+    parser.add_argument("--model-path", required=True, help="Path to saved model.pt")
+    parser.add_argument("--out-csv", default="submission.csv", help="Destination CSV for predictions")
     parser.add_argument(
         "--model-type",
         choices=["cnn", "transformer"],
