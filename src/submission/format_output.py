@@ -17,5 +17,9 @@ def kaggle_submission_df(
     """Return a DataFrame in the required submission format."""
     if id_to_label is not None:
         gestures = [id_to_label[int(g)] for g in gesture_ids]
-        return pd.DataFrame({"sequence_id": list(seq_ids), "gesture": gestures})
-    return pd.DataFrame({"sequence_id": list(seq_ids), "gesture_id": list(gesture_ids)})
+        return pd.DataFrame(
+            {"sequence_id": list(seq_ids), "gesture": gestures}
+        )
+    return pd.DataFrame(
+        {"sequence_id": list(seq_ids), "gesture_id": list(gesture_ids)}
+    )

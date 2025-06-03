@@ -23,9 +23,15 @@ from src.submission.format_output import kaggle_submission_df
 # Helpers from training script
 # ---------------------------------------------------------------------------
 
-def build_encoder(model_type: str, in_ch: int, num_classes: int) -> torch.nn.Module:
+def build_encoder(
+    model_type: str, in_ch: int, num_classes: int
+) -> torch.nn.Module:
     if model_type == "cnn":
-        return CNNEncoder(in_channels=in_ch, n_classes=num_classes, latent_dim=128)
+        return CNNEncoder(
+            in_channels=in_ch,
+            n_classes=num_classes,
+            latent_dim=128,
+        )
     if model_type == "transformer":
         return TransformerEncoder(
             in_channels=in_ch,
@@ -40,7 +46,8 @@ def build_encoder(model_type: str, in_ch: int, num_classes: int) -> torch.nn.Mod
 def collate_fn(batch, bank: SymbolicFeatureBank):
     seqs, _, ids = zip(*batch)
     seqs_t = torch.stack(seqs)
-    sym_np = np.vstack([bank.extract_all(s.cpu().numpy()) for s in seqs_t])
+    feats = [bank.extract_all(s.cpu().numpy()) for s in seqs_t]
+    sym_np = np.vstack(feats)
     syms_t = torch.from_numpy(sym_np).float()
     return seqs_t, syms_t, list(ids)
 
@@ -52,7 +59,7 @@ def rule_override(
     if "thm_1" not in sensor_cols:
         return torch.zeros(seq_batch.size(0), dtype=torch.bool)
     idx = sensor_cols.index("thm_1")
-    temps = seq_batch[:, :, idx : idx + 5].mean(dim=(1, 2))
+    temps = seq_batch[:, :, idx: idx + 5].mean(dim=(1, 2))
     return temps < thresh
 
 
@@ -124,7 +131,8 @@ def run(args: argparse.Namespace) -> None:
             # ----- combine with multi-class confidence -----
             class_score = confs * args.multi_weight
             final_preds = []
-            for gs, ns, cs, cls_idx in zip(gesture_score, none_score, class_score, top_cls):
+            pairs = zip(gesture_score, none_score, class_score, top_cls)
+            for gs, ns, cs, cls_idx in pairs:
                 if ns >= gs + cs or cs < args.threshold:
                     final_preds.append(0)
                 else:
@@ -143,16 +151,43 @@ def run(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SIREN inference")
     parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--checkpoint", required=True, help="Path to .pt model")
+    parser.add_argument(
+        "--checkpoint", required=True, help="Path to .pt model"
+    )
     parser.add_argument("--output", default="submission.csv")
-    parser.add_argument("--model-type", choices=["cnn", "transformer"], default="transformer")
-    parser.add_argument("--fusion", choices=["concat", "gated"], default="gated")
+    parser.add_argument(
+        "--model-type",
+        choices=["cnn", "transformer"],
+        default="transformer",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=["concat", "gated"],
+        default="gated",
+    )
     parser.add_argument("--pool", choices=["mean", "cls"], default="mean")
     parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold")
-    parser.add_argument("--binary-weight", type=float, default=0.5, help="Vote weight for binary detector")
-    parser.add_argument("--multi-weight", type=float, default=0.5, help="Vote weight for multi-class classifier")
-    parser.add_argument("--rules", action="store_true", help="Enable rule-based override")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Confidence threshold",
+    )
+    parser.add_argument(
+        "--binary-weight",
+        type=float,
+        default=0.5,
+        help="Vote weight for binary detector",
+    )
+    parser.add_argument(
+        "--multi-weight",
+        type=float,
+        default=0.5,
+        help="Vote weight for multi-class classifier",
+    )
+    parser.add_argument(
+        "--rules", action="store_true", help="Enable rule-based override"
+    )
     parser.add_argument("--no-thermo", action="store_true")
     parser.add_argument("--no-tof", action="store_true")
     args = parser.parse_args()
