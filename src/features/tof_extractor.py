@@ -14,7 +14,7 @@ quality:
     0. mean_dist        – mean of valid ToF readings (scaled 0‑1)
     1. std_dist         – standard deviation of valid readings
     2. valid_ratio      – fraction of pixels that returned >0 (non‑missing)
-    3. spatial_entropy  – Shannon entropy over the 8×8 histogram of distances
+    3. spatial_entropy  – Shannon entropy over the 16‑bin histogram of distances
 
 The output is suitable for concatenation into the FusionNet symbolic vector.
 """
