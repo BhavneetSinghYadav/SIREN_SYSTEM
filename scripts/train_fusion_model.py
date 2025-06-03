@@ -111,7 +111,9 @@ def train(args: argparse.Namespace) -> None:
     train_len = int(0.9 * len(ds_full))
     ds_train, ds_val = random_split(ds_full, [train_len, len(ds_full) - train_len])
 
-    frame_cols = dl.ALL_COLUMNS  # after sensor toggles, loader will subset internally
+    # Use dataset's active sensor columns so symbolic extraction aligns
+    # with the actual feature ordering produced by `SequenceDataset`.
+    frame_cols = ds_full.sensor_cols
     sym_bank = SymbolicFeatureBank(frame_cols)
     print(f"[INFO] symbolic dim  = {sym_bank.dim()}")
 
