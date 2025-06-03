@@ -2,7 +2,7 @@
 src/data/preprocessing.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Multimodal dataset cleaner for the SIREN project (v0.3).
+Multimodal dataset cleaner for the SIREN project (v0.4).
 
 Upgrades from the previous IMU‑only version:
   • Supports **Thermopile** (5 cols) & **ToF** (5×64 = 320 cols)
@@ -19,6 +19,9 @@ from pathlib import Path
 import json
 import numpy as np
 import pandas as pd
+
+from src.data.windowing import sliding_window
+from src.features.tremor_entropy import TremorEntropyExtractor
 
 # ------------------------------ config -------------------------------
 IMU_COLUMNS = [
@@ -54,7 +57,39 @@ def _zscore(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return (x - mu) / std
 
 
-def clean_split(raw_csv: Path, out_csv: Path, label_map: dict[str, int] | None, is_train: bool):
+def _zscore_streams(x: np.ndarray) -> np.ndarray:
+    """Normalise IMU, thermopile and ToF streams independently."""
+    imu_end = len(IMU_COLUMNS)
+    thm_end = imu_end + len(THERMO_COLUMNS)
+    x[:, :imu_end] = _zscore(x[:, :imu_end])
+    x[:, imu_end:thm_end] = _zscore(x[:, imu_end:thm_end])
+    x[:, thm_end:] = _zscore(x[:, thm_end:])
+    return x
+
+
+def _resample_sequence(seq: np.ndarray, target_len: int) -> np.ndarray:
+    """Linear interpolation to a fixed number of frames."""
+    t = seq.shape[0]
+    if t == target_len:
+        return seq
+    old_idx = np.linspace(0.0, 1.0, t)
+    new_idx = np.linspace(0.0, 1.0, target_len)
+    out = np.empty((target_len, seq.shape[1]), dtype=seq.dtype)
+    for i in range(seq.shape[1]):
+        out[:, i] = np.interp(new_idx, old_idx, seq[:, i])
+    return out
+
+
+def clean_split(
+    raw_csv: Path,
+    out_csv: Path,
+    label_map: dict[str, int] | None,
+    is_train: bool,
+    *,
+    n_frames: int = SEQ_LEN,
+    window_size: int | None = None,
+    window_stride: int | None = None,
+):
     """Process one split (train or test)."""
     df = pd.read_csv(raw_csv)
 
@@ -70,7 +105,13 @@ def clean_split(raw_csv: Path, out_csv: Path, label_map: dict[str, int] | None, 
             label_map = {g: i for i, g in enumerate(unique)}
         df["gesture_id"] = df["gesture"].map(label_map)
 
+    if window_size is None:
+        window_size = n_frames
+    if window_stride is None:
+        window_stride = window_size
+
     processed_rows = []
+    tremor_ex = TremorEntropyExtractor(acc_start_idx=0)
 
     for seq_id, grp in df.groupby("sequence_id"):
         grp = grp.sort_values("sequence_counter")
@@ -82,18 +123,25 @@ def clean_split(raw_csv: Path, out_csv: Path, label_map: dict[str, int] | None, 
         # 2) nan/inf → 0
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 3) per-sequence z‑score
-        X = _zscore(X)
+        # 3) per-stream normalisation
+        X = _zscore_streams(X)
 
-        # 4) pad/crop
-        X = _pad_or_crop(X)
+        # 4) resample to fixed frame count
+        X = _resample_sequence(X, n_frames)
 
-        proc = pd.DataFrame(X, columns=ALL_COLUMNS)
-        proc.insert(0, "sequence_id", seq_id)
-        if is_train:
-            gid = label_map[grp["gesture"].iloc[0]]
-            proc.insert(1, "gesture_id", gid)
-        processed_rows.append(proc)
+        # 5) window segmentation
+        windows = sliding_window(X, window_size, window_stride)
+        for w_idx, win in enumerate(windows):
+            tremor = float(tremor_ex.extract(win)[0])
+            win = _pad_or_crop(win, target_len=window_size)
+            proc = pd.DataFrame(win, columns=ALL_COLUMNS)
+            seq_tag = f"{seq_id}_{w_idx}" if len(windows) > 1 else seq_id
+            proc.insert(0, "sequence_id", seq_tag)
+            if is_train:
+                gid = label_map[grp["gesture"].iloc[0]]
+                proc.insert(1, "gesture_id", gid)
+            proc["tremor_entropy"] = tremor
+            processed_rows.append(proc)
 
     out_df = pd.concat(processed_rows, ignore_index=True)
     out_df.to_csv(out_csv, index=False)
@@ -101,7 +149,14 @@ def clean_split(raw_csv: Path, out_csv: Path, label_map: dict[str, int] | None, 
 
 # ---------------------- public entry-point ---------------------------
 
-def run_preprocessing(data_dir: str | Path, out_dir: str | Path):
+def run_preprocessing(
+    data_dir: str | Path,
+    out_dir: str | Path,
+    *,
+    n_frames: int = SEQ_LEN,
+    window_size: int | None = None,
+    window_stride: int | None = None,
+):
     data_dir = Path(data_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +168,9 @@ def run_preprocessing(data_dir: str | Path, out_dir: str | Path):
         out_csv=out_dir / "train_processed.csv",
         label_map=label_map,
         is_train=True,
+        n_frames=n_frames,
+        window_size=window_size,
+        window_stride=window_stride,
     )
 
     _ = clean_split(
@@ -120,6 +178,9 @@ def run_preprocessing(data_dir: str | Path, out_dir: str | Path):
         out_csv=out_dir / "test_processed.csv",
         label_map=label_map,
         is_train=False,
+        n_frames=n_frames,
+        window_size=window_size,
+        window_stride=window_stride,
     )
 
     with open(out_dir / "label_map.json", "w") as jf:
@@ -131,8 +192,22 @@ def run_preprocessing(data_dir: str | Path, out_dir: str | Path):
 # ----------------------------- CLI -----------------------------------
 if __name__ == "__main__":
     import argparse
+
     p = argparse.ArgumentParser(description="Preprocess multimodal BFRB dataset")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--frames", type=int, default=SEQ_LEN,
+                   help="Target number of frames after resampling")
+    p.add_argument("--window", type=int, default=None,
+                   help="Length of sliding windows (default: frames)")
+    p.add_argument("--stride", type=int, default=None,
+                   help="Stride for windowing (default: window size)")
     args = p.parse_args()
-    run_preprocessing(args.data_dir, args.out_dir)
+
+    run_preprocessing(
+        args.data_dir,
+        args.out_dir,
+        n_frames=args.frames,
+        window_size=args.window,
+        window_stride=args.stride,
+    )
